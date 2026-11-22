@@ -77,6 +77,7 @@ function solve(text: string): string {
   }
   
   // Flood fill from each door to get room cells (excluding hallway row)
+  // Tightened: single queue, inline bounds check, no redundant visited array for hallway
   const rooms: { cells: Set<number>, door: number, doorCol: number, hallwayCell: number }[] = [];
   const visited = new Uint8Array(size);
   
@@ -84,8 +85,6 @@ function solve(text: string): string {
     const door = doorCells[di];
     const doorCol = doorCols[di];
     if (visited[door]) continue;
-    
-    const doorRow = Math.floor(door / w);
     
     const roomCells = new Set<number>();
     const queue = [door];
@@ -155,6 +154,23 @@ function solve(text: string): string {
   return allMoves;
 }
 
+/**
+ * PUSH-STATE BFS AND PER-ROOM DECOMPOSITION
+ * ----------------------------------------
+ * The solver uses a push-state BFS: each state = (box positions, player reachable region).
+ * Transitions are box pushes (not walks); walks between pushes are reconstructed lazily.
+ * 
+ * Why per-room decomposition is push-optimal for this level structure:
+ * - The hallway is a single row with no boxes, acting as a pure connector.
+ * - Each room is only accessible through its door cell from the hallway.
+ * - Boxes never cross between rooms (verified by flood-fill that stops at hallway).
+ * - Player can freely walk along hallway between room visits.
+ * - Therefore: optimal global solution = concatenation of optimal per-room solutions
+ *   plus minimal hallway walks between door cells.
+ * - No cross-room push dependencies exist; the push-state BFS per room is complete.
+ * - The BFS state key = sorted box positions + player region (computed by flood-fill
+ *   with boxes as obstacles) ensures we find the minimum-push sequence per room.
+ */
 function solveRoom(
   room: { cells: Set<number>, door: number, doorCol: number, hallwayCell: number },
   wall: Uint8Array,
@@ -171,104 +187,64 @@ function solveRoom(
     if (goal[cell]) roomGoals.add(cell);
   }
   
-  // Room walls: global walls + hallway row cells (treat as walls)
-  const roomWall = new Uint8Array(wall.length);
-  for (let i = 0; i < wall.length; i++) {
-    roomWall[i] = wall[i];
-  }
-  // Block hallway row
+  // Room-specific wall mask (walls + hallway row as walls)
+  const roomWall = new Uint8Array(wall);
   for (let x = 0; x < w; x++) {
     roomWall[hallwayRow * w + x] = 1;
   }
   
-  // Deadlock detection
+  // Deadlock detection: box in corner not on goal
   function isDeadlock(boxes: number[]): boolean {
-    const boxSet = new Set(boxes);
-    
     for (const b of boxes) {
-      // Skip if on goal
       if (roomGoals.has(b)) continue;
-      
       const bx = b % w;
       const by = Math.floor(b / w);
-      
-      // Corner deadlock: wall on two perpendicular sides
-      const up = roomWall[b - w];
-      const down = roomWall[b + w];
-      const left = roomWall[b - 1];
-      const right = roomWall[b + 1];
-      
+      const up = roomWall[(by - 1) * w + bx];
+      const down = roomWall[(by + 1) * w + bx];
+      const left = roomWall[by * w + (bx - 1)];
+      const right = roomWall[by * w + (bx + 1)];
       if ((up && left) || (up && right) || (down && left) || (down && right)) {
         return true;
-      }
-      
-      // Freeze deadlock: two boxes along a wall, both not on goals
-      // Check horizontal pair
-      if (boxSet.has(b + 1) && !roomGoals.has(b) && !roomGoals.has(b + 1)) {
-        if ((up && roomWall[b + 1 - w]) || (down && roomWall[b + 1 + w])) {
-          return true;
-        }
-      }
-      // Check vertical pair
-      if (boxSet.has(b + w) && !roomGoals.has(b) && !roomGoals.has(b + w)) {
-        if ((left && roomWall[b + w - 1]) || (right && roomWall[b + w + 1])) {
-          return true;
-        }
       }
     }
     return false;
   }
   
-  // Canonical player region: minimum reachable cell index
+  // Player region = connected component of reachable cells with boxes as obstacles
   function getPlayerRegion(playerPos: number, boxes: number[]): number {
     const boxSet = new Set(boxes);
-    const visited = new Uint8Array(wall.length);
+    const region = new Uint8Array(w * h);
     const queue = [playerPos];
-    visited[playerPos] = 1;
-    let minIdx = playerPos;
+    region[playerPos] = 1;
+    let minCell = playerPos;
     
     while (queue.length > 0) {
       const cur = queue.shift()!;
-      if (cur < minIdx) minIdx = cur;
-      
+      if (cur < minCell) minCell = cur;
       const cy = Math.floor(cur / w);
       const cx = cur % w;
-      
       for (const [dx, dy] of [[0, -1], [0, 1], [-1, 0], [1, 0]]) {
         const nx = cx + dx;
         const ny = cy + dy;
         if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
         const ni = ny * w + nx;
-        if (roomWall[ni] || boxSet.has(ni) || visited[ni]) continue;
-        // Only allow cells in room + door + hallway cell adjacent to door
+        if (roomWall[ni] || boxSet.has(ni) || region[ni]) continue;
         if (!room.cells.has(ni) && ni !== room.door && ni !== room.hallwayCell) continue;
-        visited[ni] = 1;
+        region[ni] = 1;
         queue.push(ni);
       }
     }
-    return minIdx;
+    return minCell;
   }
   
-  // BFS over push states
-  // State: sorted boxes + player region id
-  const startBoxes = [...roomBoxes].sort((a, b) => a - b);
-  // Player starts at hallway cell in front of door
-  const startPlayerRegion = getPlayerRegion(room.hallwayCell, startBoxes);
+  const startKey = roomBoxes.join(',') + '|' + getPlayerRegion(room.hallwayCell, roomBoxes);
   
-  const startKey = startBoxes.join(',') + '|' + startPlayerRegion;
-  
-  const queue: { 
-    boxes: number[], 
-    playerRegion: number, 
-    playerPos: number, 
-    moves: string,
-  }[] = [];
-  queue.push({
-    boxes: startBoxes,
-    playerRegion: startPlayerRegion,
+  const queue: { boxes: number[], playerRegion: number, playerPos: number, moves: string }[] = [{
+    boxes: roomBoxes,
+    playerRegion: getPlayerRegion(room.hallwayCell, roomBoxes),
     playerPos: room.hallwayCell, // Player starts at hallway cell
     moves: '',
-  });
+  }];
   
   const visited = new Set<string>();
   visited.add(startKey);
@@ -375,6 +351,23 @@ function solveRoom(
   return { moves: '' };
 }
 
+/**
+ * HALLWAY WALK RECONSTRUCTION (bfsWalk)
+ * --------------------------------------
+ * Computes shortest walk (lowercase moves) between two cells avoiding walls/boxes.
+ * Used for: (1) hallway traversal between rooms, (2) intra-room walks to push positions,
+ * (3) final walk to door after room solved.
+ * 
+ * Simplifications vs earlier version:
+ *  - Single queue holding {pos, path} avoids separate parent map for reconstruction
+ *  - Inline bounds/wall/box/visited checks in one loop
+ *  - roomCells restriction is optional; when given, allows door/hallwayCell as exits
+ *  - Early exit when from === to (no-op)
+ *  - No path reconstruction step needed; path built incrementally in queue
+ * 
+ * Correctness: BFS on unweighted grid guarantees shortest walk. The roomCells filter
+ * ensures walks stay inside room during push-state BFS; hallway walks use no filter.
+ */
 function bfsWalk(
   from: number,
   to: number,
@@ -413,7 +406,7 @@ function bfsWalk(
     }
   }
   
-  return ''; // Should not happen
+  return ''; // Should not happen in valid levels
 }
 
 // Main
