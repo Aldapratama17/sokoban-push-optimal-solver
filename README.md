@@ -1,3 +1,5 @@
+![Competition](https://img.shields.io/badge/make.fun-sokoban--solver--01-blue) ![Reward](https://img.shields.io/badge/reward-%24100-green) ![Status](https://img.shields.io/badge/phase-final-orange)
+
 # Sokoban Solver
 
 A push-optimal Sokoban solver for the make.fun competition. This solver decomposes levels into independent rooms connected by a central hallway, solves each room with a push-optimal BFS over push states, and concatenates the solutions.
